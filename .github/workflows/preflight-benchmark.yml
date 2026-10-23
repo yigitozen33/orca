@@ -1,111 +1,263 @@
-name: Preflight comparison
+name: Linux package and relay runner comparison
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
-    paths:
-      - .github/workflows/preflight-benchmark.yml
-      - config/scripts/benchmark-preflight-*.mjs
-      - config/scripts/preflight-benchmark-command.mjs
-  workflow_dispatch:
+  workflow_dispatch: null
 permissions:
   contents: read
-concurrency:
-  group: preflight-comparison-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
 env:
-  ORCA_BACKGROUND_LAUNCH: '1'
+  ORCA_BACKGROUND_LAUNCH: "1"
 jobs:
-  compilers:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft != true
-    # Native compiler peaks can exhaust the standard ARM runner before samples are saved.
-    runs-on: blacksmith-8vcpu-ubuntu-2404-arm
-    timeout-minutes: 25
+  package:
+    name: package (${{ matrix.runner }}, ${{ matrix.repetition }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - name: Record runner and tested source
+        run: |
+          git rev-parse HEAD
+          uname -a
+          lscpu
+          printf 'ImageOS=%s ImageVersion=%s\n' "$ImageOS" "$ImageVersion"
+          docker --version
+      - name: Cache electron-builder downloads
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.cache/electron-builder
+          key: electron-builder-linux-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            electron-builder-linux-
+      - uses: ./.github/actions/prepare-linux-package-fixture
+        id: daemon-fixture-cache-restore
+        with:
+          fixture: daemon-shutdown-descendants
+          load: "false"
+      - name: Load daemon shutdown fixture image
+        id: daemon-fixture-cache
+        background: true
+        env:
+          FIXTURE: daemon-shutdown-descendants
+          CACHE_HIT: ${{ steps.daemon-fixture-cache-restore.outputs.cache-hit }}
+        run: bash .github/actions/prepare-linux-package-fixture/load-fixture.sh
       - uses: ./.github/actions/install-node-dependencies
         with:
-          native-runtime: none
-          node-version: '24'
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+          native-runtime: electron
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            mobile/pnpm-lock.yaml
+      - uses: ./.github/actions/install-mobile-dependencies
+      - wait: daemon-fixture-cache
+      - name: Verify Linux daemon shutdown descendant cleanup
+        env:
+          ORCA_BACKGROUND_LAUNCH: "1"
+          ORCA_DAEMON_SHUTDOWN_FIXTURE_CACHE_IMAGE: ${{ steps.daemon-fixture-cache.outputs.image }}
+        run: node config/scripts/run-daemon-shutdown-descendants-docker.mjs
+      - name: Test Linux Electron lifecycle boundary
+        env:
+          ORCA_BACKGROUND_LAUNCH: "1"
+        run: xvfb-run --auto-servernum pnpm exec vitest run --config config/vitest.config.ts --no-file-parallelism src/main/browser/browser-client-page-renderer-lifecycle.electron.test.ts src/main/browser/browser-route-tcp-egress.electron.test.ts src/main/browser/browser-route-webrtc-egress.electron.test.ts src/main/browser/browser-route-h3-egress.electron.test.ts src/main/browser/browser-route-dns-prefetch.electron.test.ts src/main/persistence/profile-state/profile-state-writer-stall.electron.test.ts src/main/browser/popup-origin-chrome.electron.test.ts src/main/browser/browser-link-materialization.electron.test.ts src/main/browser/browser-popup-compatibility.electron.test.ts src/main/browser/browser-popup-adapter-compatibility.electron.test.ts src/main/browser/browser-popup-native-compatibility.electron.test.ts src/main/browser/browser-popup-background-compatibility.electron.test.ts
+      - name: Restore native components
+        id: linux-native-restore
+        uses: ./.github/actions/prepare-wayland-clipboard
         with:
-          bun-version-file: config/.bun-version
-      - name: Compare native and Bun typechecking
-        run: node config/scripts/benchmark-preflight-compilers.mjs
+          build: "false"
+      - name: Build native components
+        id: linux-native
+        background: true
+        env:
+          CACHE_HIT: ${{ steps.linux-native-restore.outputs.cache-hit }}
+        run: bash .github/actions/prepare-wayland-clipboard/build-or-validate.sh
+      - uses: ./.github/actions/prepare-linux-package-fixture
+        id: shutdown-fixture-cache-restore
+        with:
+          fixture: headless-serve-shutdown
+          load: "false"
+      - name: Load headless serve shutdown fixture image
+        id: shutdown-fixture-cache
+        background: true
+        env:
+          FIXTURE: headless-serve-shutdown
+          CACHE_HIT: ${{ steps.shutdown-fixture-cache-restore.outputs.cache-hit }}
+        run: bash .github/actions/prepare-linux-package-fixture/load-fixture.sh
+      - uses: ./.github/actions/prepare-linux-package-fixture
+        id: cli-fixture-cache-restore
+        with:
+          fixture: cli-launch-contract
+          load: "false"
+      - name: Load CLI launch contract fixture image
+        id: cli-fixture-cache
+        background: true
+        env:
+          FIXTURE: cli-launch-contract
+          CACHE_HIT: ${{ steps.cli-fixture-cache-restore.outputs.cache-hit }}
+        run: bash .github/actions/prepare-linux-package-fixture/load-fixture.sh
+      - name: Install Linux package tooling
+        id: linux-package-tools
+        background: true
+        run: |
+          # Use the shell lane's bounded refresh; required tooling installation stays fatal.
+          sudo tee /etc/apt/apt.conf.d/99-orca-package-tools >/dev/null <<'APTCONF'
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          Acquire::Retries "1";
+          APTCONF
+          timeout 120 sudo apt-get update || true
+          timeout 300 sudo apt-get install -y cpio rpm
+      - name: Build package inputs
+        env:
+          ORCA_CI_MAIN_SOURCEMAPS: "0"
+        run: |
+          status=0
+          pnpm run build:cli || status=1
+
+          scripts=(build:wsl-guest build:electron-vite:parallel)
+          pids=()
+          for script in "${scripts[@]}"; do
+            pnpm run "$script" &
+            pids+=("$!")
+          done
+
+          for pid in "${pids[@]}"; do
+            wait "$pid" || status=1
+          done
+          exit "$status"
+      - name: Project web client from renderer build
+        id: web-client
+        background: true
+        run: pnpm run build:web-from-renderer
+      - name: Build mobile web bundle
+        run: pnpm run build:mobile-web
+      - wait:
+          - linux-native
+          - linux-package-tools
+          - web-client
+      - name: Package unpacked app
+        env:
+          ORCA_BACKGROUND_LAUNCH: "1"
+          ORCA_REUSE_PREPARED_NATIVE_RUNTIME: "1"
+        run: |
+          pnpm exec electron-builder --config config/electron-builder.config.cjs --linux dir --x64 --publish never
+          node config/scripts/package-linux-formats.mjs
+      - name: Verify root-package marker payloads
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          deb="dist/orca-ide_${version}_amd64.deb"
+          rpm="dist/orca-ide-${version}.x86_64.rpm"
+          test -s "$deb"
+          test -s "$rpm"
+          deb_marker="$(dpkg-deb --fsys-tarfile "$deb" | tar -xOf - ./opt/Orca/resources/package-type)"
+          rpm_marker="$(rpm2cpio "$rpm" | cpio --quiet --extract --to-stdout ./opt/Orca/resources/package-type)"
+          [[ "$deb_marker" == deb ]] || { echo "Expected deb marker, got: $deb_marker"; exit 1; }
+          [[ "$rpm_marker" == rpm ]] || { echo "Expected rpm marker, got: $rpm_marker"; exit 1; }
+          # Only the AppImage carries the pinned Node (config/scripts/appimage-node-runtime.cjs).
+          if dpkg-deb --fsys-tarfile "$deb" | tar -t | grep '/resources/node-runtime' >/dev/null; then
+            echo "The deb must not carry the AppImage's Node"; exit 1
+          fi
+          if rpm2cpio "$rpm" | cpio --quiet -t | grep '/resources/node-runtime' >/dev/null; then
+            echo "The rpm must not carry the AppImage's Node"; exit 1
+          fi
+          appimage_root="$(mktemp -d)"
+          (cd "$appimage_root" && "$GITHUB_WORKSPACE/dist/orca-linux.AppImage" --appimage-extract 'resources/node-runtime/bin/node' >/dev/null)
+          test -x "$appimage_root/squashfs-root/resources/node-runtime/bin/node"
+          "$appimage_root/squashfs-root/resources/node-runtime/bin/node" --version
+          rm -rf "$appimage_root"
+          ls -l dist/orca-linux.AppImage "$deb" "$rpm"
       - uses: actions/upload-artifact@v7
-        if: always()
         with:
-          name: preflight-compilers
-          path: .build/preflight-benchmark/
-          retention-days: 30
-  static-analysis:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft != true
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 25
+          name: runner-comparison-package-${{ matrix.runner }}-${{ matrix.repetition }}
+          path: dist/orca-linux.AppImage
+          retention-days: 3
+          compression-level: 0
+      - wait: shutdown-fixture-cache
+      - name: Verify headless serve signal shutdown
+        env:
+          ORCA_SHUTDOWN_FIXTURE_CACHE_IMAGE: ${{ steps.shutdown-fixture-cache.outputs.image }}
+        run: node config/scripts/run-headless-serve-shutdown-docker.mjs --appimage dist/orca-linux.AppImage --all-entrypoints
+      - wait: cli-fixture-cache
+      - name: Verify Linux CLI launch contract
+        env:
+          ORCA_CLI_FIXTURE_CACHE_IMAGE: ${{ steps.cli-fixture-cache.outputs.image }}
+        run: node config/scripts/run-linux-cli-launch-contract-docker.mjs --appimage dist/orca-linux.AppImage
+      - name: Smoke packaged CLI
+        run: node config/scripts/smoke-packaged-cli.mjs --app-dir=dist/linux-unpacked
+      - name: Smoke packaged hang watchdog worker
+        run: xvfb-run --auto-servernum node config/scripts/smoke-packaged-hang-watchdog-worker.mjs --app-dir=dist/linux-unpacked
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - blacksmith-4vcpu-ubuntu-2404
+        repetition:
+          - 1
+          - 2
+  relay:
+    name: relay (${{ matrix.runner }}, ${{ matrix.repetition }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - blacksmith-4vcpu-ubuntu-2404
+        repetition:
+          - 1
+          - 2
+        node:
+          - "24"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - name: Record runner and tested source
+        run: |
+          git rev-parse HEAD
+          uname -a
+          lscpu
+          printf 'ImageOS=%s ImageVersion=%s\n' "$ImageOS" "$ImageVersion"
+          docker --version
       - uses: ./.github/actions/install-node-dependencies
+        id: root_dependencies
         with:
           native-runtime: none
-          node-version: '24'
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version-file: config/.bun-version
-      - name: Compare anti-slop patch and script runtimes
-        run: node config/scripts/benchmark-preflight-static-analysis.mjs
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: preflight-static-analysis
-          path: .build/preflight-benchmark/
-          retention-days: 30
-  compatibility-imports:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft != true
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          fetch-depth: 2
-      - uses: ./.github/actions/install-node-dependencies
-        with:
-          native-runtime: none
-          node-version: '24'
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version-file: config/.bun-version
-      - name: Compare compatibility-import scan and runtimes
-        run: node config/scripts/benchmark-preflight-compat-boundary.mjs
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: preflight-compat-boundary
-          path: .build/preflight-benchmark/
-          retention-days: 30
-  localization-extraction:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft != true
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 12
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/install-node-dependencies
-        with:
-          native-runtime: none
-          node-version: '24'
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version-file: config/.bun-version
-      - name: Compare localization extraction runtimes and complete catalogs
-        run: node config/scripts/benchmark-preflight-localization-extraction.mjs
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: preflight-localization-extraction
-          path: .build/preflight-benchmark/
-          retention-days: 30
+          node-version: ${{ matrix.node }}
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            cloud/pnpm-lock.yaml
+      - name: Resolve Chrome for the browser provider
+        id: browser_executable
+        if: success()
+        run: |
+          set -euo pipefail
+          chrome="$(command -v google-chrome || command -v google-chrome-stable || true)"
+          if [ -z "$chrome" ]; then
+            echo "::error::No Google Chrome on the runner; the browser provider test would silently skip."
+            exit 1
+          fi
+          "$chrome" --version
+          echo "executable=$chrome" >> "$GITHUB_OUTPUT"
+      - name: Test external Chromium browser provider
+        if: success()
+        env:
+          ORCA_BACKGROUND_LAUNCH: "1"
+          ORCA_BROWSER_EXECUTABLE: ${{ steps.browser_executable.outputs.executable }}
+        run: |
+          pnpm exec vitest run --config config/vitest.config.ts \
+            src/main/orcad/external-chromium-browser-process.integration.test.ts
+      - name: Install relay integration dependencies
+        id: relay_dependencies
+        if: ${{ !cancelled() && steps.root_dependencies.outcome == 'success' }}
+        working-directory: cloud
+        run: |
+          pnpm --filter '@orca-cloud/relay...' install --frozen-lockfile --ignore-scripts
+          pnpm --filter '@orca-cloud/relay^...' build
+      - name: Test relay integration contracts
+        if: ${{ !cancelled() && steps.relay_dependencies.outcome == 'success' }}
+        env:
+          ORCA_BACKGROUND_LAUNCH: "1"
+        run: pnpm exec vitest run --config config/vitest.config.ts tests/e2e/relay-region-compatibility.unit.test.ts tests/e2e/relay-region-correction.unit.test.ts
